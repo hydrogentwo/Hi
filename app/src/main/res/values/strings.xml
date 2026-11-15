@@ -1,0 +1,18 @@
+<resources>
+    <string name="app_name">KubeMesh</string>
+    <string name="nav_cluster">Cluster</string>
+    <string name="nav_connect">Mesh</string>
+    <string name="nav_workloads">Pods</string>
+    <string name="role_control_plane">Control Plane</string>
+    <string name="role_worker">Worker Node</string>
+    <string name="daemon_channel_name">KubeMesh Node Agent</string>
+    <string name="daemon_channel_desc">Keeps the local Kubernetes mesh node server active for LAN peer discovery and distributed compute.</string>
+    <string name="daemon_notification_title">KubeMesh Node Active</string>
+    <string name="daemon_notification_text">Serving compute mesh endpoint on LAN</string>
+    <string name="action_deploy_pod">Deploy Pod</string>
+    <string name="action_connect_peer">Connect Node</string>
+    <string name="action_scan_lan">Scan LAN</string>
+    <string name="action_stop_scan">Stop Scan</string>
+    <string name="action_copy_endpoint">Copy</string>
+    <string name="action_disconnect">Drain &amp; Disconnect</string>
+</resources>

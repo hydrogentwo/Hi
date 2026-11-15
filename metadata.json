@@ -1,0 +1,6 @@
+{
+  "name": "KubeMesh",
+  "description": "Unify two Android devices over LAN into a Kubernetes-style compute cluster to pool CPU cores, RAM, and execute distributed workloads.",
+  "requestFramePermissions": [],
+  "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
+}
