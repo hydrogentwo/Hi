@@ -4,12 +4,18 @@ import com.example.cluster.compute.ComputeEngine
 import com.example.cluster.model.AiCorePromptRequest
 import com.example.cluster.model.AiCorePromptResponse
 import com.example.cluster.model.AiCoreStatus
+import com.example.cluster.model.ClusterPod
+import com.example.cluster.model.ClusterSnapshotResponse
 import com.example.cluster.model.NodeTelemetry
 import com.example.cluster.model.PairRequest
 import com.example.cluster.model.PairResponse
+import com.example.cluster.model.PodActionResponse
+import com.example.cluster.model.PodSubmitRequest
 import com.example.cluster.model.ShardExecuteRequest
 import com.example.cluster.model.ShardExecuteResponse
 import com.squareup.moshi.Moshi
+import com.squareup.moshi.Types
+import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.Job
@@ -32,7 +38,13 @@ class NodeHttpServer(
     private val onPeerPaired: (NodeTelemetry, remoteIp: String) -> Unit,
     private val onPeerUnpaired: (String) -> Unit,
     private val onServerLog: (String) -> Unit,
-    private val onExecuteAiPrompt: (suspend (AiCorePromptRequest) -> AiCorePromptResponse)? = null
+    private val onExecuteAiPrompt: (suspend (AiCorePromptRequest) -> AiCorePromptResponse)? = null,
+    private val getKnownPeers: (() -> List<NodeTelemetry>)? = null,
+    private val onGossipPeersReceived: ((List<NodeTelemetry>) -> Unit)? = null,
+    private val getClusterSnapshot: (() -> ClusterSnapshotResponse)? = null,
+    private val getPods: (() -> List<ClusterPod>)? = null,
+    private val onSubmitPod: (suspend (PodSubmitRequest) -> PodActionResponse)? = null,
+    private val onCancelPod: ((String) -> PodActionResponse)? = null
 ) {
     private val scope = CoroutineScope(SupervisorJob() + Dispatchers.IO)
     private var serverSocket: ServerSocket? = null
@@ -47,6 +59,16 @@ class NodeHttpServer(
         private set
 
     private val telemetryAdapter = moshi.adapter(NodeTelemetry::class.java)
+    private val nodeListAdapter = moshi.adapter<List<NodeTelemetry>>(
+        Types.newParameterizedType(List::class.java, NodeTelemetry::class.java)
+    )
+    private val podAdapter = moshi.adapter(ClusterPod::class.java)
+    private val podListAdapter = moshi.adapter<List<ClusterPod>>(
+        Types.newParameterizedType(List::class.java, ClusterPod::class.java)
+    )
+    private val snapshotAdapter = moshi.adapter(ClusterSnapshotResponse::class.java)
+    private val podSubmitReqAdapter = moshi.adapter(PodSubmitRequest::class.java)
+    private val podActionRespAdapter = moshi.adapter(PodActionResponse::class.java)
     private val pairReqAdapter = moshi.adapter(PairRequest::class.java)
     private val pairRespAdapter = moshi.adapter(PairResponse::class.java)
     private val shardReqAdapter = moshi.adapter(ShardExecuteRequest::class.java)
@@ -94,58 +116,95 @@ class NodeHttpServer(
     }
 
     private suspend fun handleClient(socket: Socket) {
-        socket.use { s ->
-            s.soTimeout = 60_000
-            val input = BufferedInputStream(s.getInputStream())
-            val rawHeader = readHeaderBytes(input) ?: return
-            val headerText = String(rawHeader, StandardCharsets.US_ASCII)
-            val lines = headerText.split("\r\n")
-            if (lines.isEmpty()) return
+        try {
+            socket.use { s ->
+                s.soTimeout = 95_000
+                val input = BufferedInputStream(s.getInputStream())
+                val rawHeader = readHeaderBytes(input) ?: return
+                val headerText = String(rawHeader, StandardCharsets.US_ASCII)
+                val lines = headerText.split("\r\n")
+                if (lines.isEmpty()) return
 
-            val requestParts = lines[0].split(" ")
-            if (requestParts.size < 2) return
-            val method = requestParts[0].uppercase()
-            val path = requestParts[1].substringBefore("?")
+                val requestParts = lines[0].split(" ")
+                if (requestParts.size < 2) return
+                val method = requestParts[0].uppercase()
+                val path = requestParts[1].substringBefore("?")
 
-            val headers = mutableMapOf<String, String>()
-            for (i in 1 until lines.size) {
-                val line = lines[i]
-                val colon = line.indexOf(':')
-                if (colon > 0) {
-                    val k = line.substring(0, colon).trim().lowercase()
-                    val v = line.substring(colon + 1).trim()
-                    headers[k] = v
+                if (method == "OPTIONS") {
+                    writeHttpResponse(s, 204, "No Content", "")
+                    return
                 }
+
+                val headers = mutableMapOf<String, String>()
+                for (i in 1 until lines.size) {
+                    val line = lines[i]
+                    val colon = line.indexOf(':')
+                    if (colon > 0) {
+                        val k = line.substring(0, colon).trim().lowercase()
+                        val v = line.substring(colon + 1).trim()
+                        headers[k] = v
+                    }
+                }
+
+                val contentLength = headers["content-length"]?.toIntOrNull()?.coerceIn(0, 4 * 1024 * 1024) ?: 0
+                val bodyBytes = if (contentLength > 0) readExactBytes(input, contentLength) else ByteArray(0)
+                val bodyText = String(bodyBytes, StandardCharsets.UTF_8)
+                val remoteIp = s.inetAddress?.hostAddress ?: ""
+                val headerToken = headers["x-cluster-token"].orEmpty()
+
+                val (statusCode, statusText, responseJson) = try {
+                    routeRequest(
+                        method = method,
+                        path = path,
+                        headerToken = headerToken,
+                        bodyText = bodyText,
+                        remoteIp = remoteIp
+                    )
+                } catch (ce: CancellationException) {
+                    throw ce
+                } catch (t: Throwable) {
+                    onServerLog("HTTP 500 on $method $path: ${t.message}")
+                    Triple(500, "Internal Server Error", """{"error":"Internal node server error"}""")
+                }
+
+                writeHttpResponse(s, statusCode, statusText, responseJson)
             }
-
-            val contentLength = headers["content-length"]?.toIntOrNull()?.coerceIn(0, 4 * 1024 * 1024) ?: 0
-            val bodyBytes = if (contentLength > 0) readExactBytes(input, contentLength) else ByteArray(0)
-            val bodyText = String(bodyBytes, StandardCharsets.UTF_8)
-            val remoteIp = s.inetAddress?.hostAddress ?: ""
-            val headerToken = headers["x-cluster-token"].orEmpty()
-
-            val (statusCode, statusText, responseJson) = routeRequest(
-                method = method,
-                path = path,
-                headerToken = headerToken,
-                bodyText = bodyText,
-                remoteIp = remoteIp
-            )
-
-            val payload = responseJson.toByteArray(StandardCharsets.UTF_8)
-            val responseHeader = buildString {
-                append("HTTP/1.1 $statusCode $statusText\r\n")
-                append("Content-Type: application/json; charset=utf-8\r\n")
-                append("Content-Length: ${payload.size}\r\n")
-                append("Connection: close\r\n\r\n")
-            }.toByteArray(StandardCharsets.US_ASCII)
-
-            s.getOutputStream().apply {
-                write(responseHeader)
-                write(payload)
-                flush()
-            }
+        } catch (ce: CancellationException) {
+            throw ce
+        } catch (_: Exception) {
+            // Client disconnected or timed out mid-flight; isolate per-connection failure
         }
+    }
+
+    private fun writeHttpResponse(
+        socket: Socket,
+        statusCode: Int,
+        statusText: String,
+        responseJson: String
+    ) {
+        val payload = responseJson.toByteArray(StandardCharsets.UTF_8)
+        val responseHeader = buildString {
+            append("HTTP/1.1 $statusCode $statusText\r\n")
+            append("Content-Type: application/json; charset=utf-8\r\n")
+            append("Access-Control-Allow-Origin: *\r\n")
+            append("Access-Control-Allow-Headers: Content-Type, X-Cluster-Token\r\n")
+            append("Access-Control-Allow-Methods: GET, POST, DELETE, OPTIONS\r\n")
+            append("Content-Length: ${payload.size}\r\n")
+            append("Connection: close\r\n\r\n")
+        }.toByteArray(StandardCharsets.US_ASCII)
+
+        socket.getOutputStream().apply {
+            write(responseHeader)
+            if (payload.isNotEmpty()) {
+                write(payload)
+            }
+            flush()
+        }
+    }
+
+    private fun isTokenAuthorized(headerToken: String, expectedToken: String, allowEmpty: Boolean = false): Boolean {
+        if (allowEmpty && headerToken.isEmpty()) return true
+        return headerToken.equals(expectedToken, ignoreCase = true)
     }
 
     private suspend fun routeRequest(
@@ -158,12 +217,85 @@ class NodeHttpServer(
         val expectedToken = getClusterToken()
         return when {
             method == "GET" && path == "/v1/health" -> {
-                if (headerToken.isNotEmpty() && !headerToken.equals(expectedToken, ignoreCase = true)) {
+                if (!isTokenAuthorized(headerToken, expectedToken, allowEmpty = true)) {
                     Triple(401, "Unauthorized", """{"error":"Cluster token mismatch"}""")
                 } else {
                     val local = getLocalTelemetry()
                     Triple(200, "OK", telemetryAdapter.toJson(local))
                 }
+            }
+
+            method == "GET" && path == "/v1/cluster/state" -> {
+                if (!isTokenAuthorized(headerToken, expectedToken)) {
+                    return Triple(401, "Unauthorized", """{"error":"Cluster token mismatch"}""")
+                }
+                val local = getLocalTelemetry()
+                val snapshot = getClusterSnapshot?.invoke() ?: run {
+                    val peers = getKnownPeers?.invoke().orEmpty()
+                    val pods = getPods?.invoke().orEmpty()
+                    ClusterSnapshotResponse(
+                        localNode = local,
+                        peers = peers,
+                        totalCpuCores = local.cpuCores + peers.sumOf { it.cpuCores },
+                        totalRamMb = local.totalRamMb + peers.sumOf { it.totalRamMb },
+                        availRamMb = local.availRamMb + peers.sumOf { it.availRamMb },
+                        activePodsCount = pods.count { it.phase.name == "RUNNING" },
+                        pods = pods
+                    )
+                }
+                Triple(200, "OK", snapshotAdapter.toJson(snapshot))
+            }
+
+            method == "GET" && path == "/v1/nodes" -> {
+                if (!isTokenAuthorized(headerToken, expectedToken)) {
+                    return Triple(401, "Unauthorized", """{"error":"Cluster token mismatch"}""")
+                }
+                val nodes = listOf(getLocalTelemetry()) + getKnownPeers?.invoke().orEmpty()
+                Triple(200, "OK", nodeListAdapter.toJson(nodes))
+            }
+
+            method == "GET" && path == "/v1/pods" -> {
+                if (!isTokenAuthorized(headerToken, expectedToken)) {
+                    return Triple(401, "Unauthorized", """{"error":"Cluster token mismatch"}""")
+                }
+                val pods = getPods?.invoke().orEmpty()
+                Triple(200, "OK", podListAdapter.toJson(pods))
+            }
+
+            method == "GET" && path.startsWith("/v1/pods/") -> {
+                if (!isTokenAuthorized(headerToken, expectedToken)) {
+                    return Triple(401, "Unauthorized", """{"error":"Cluster token mismatch"}""")
+                }
+                val podId = path.removePrefix("/v1/pods/").trim()
+                val pod = getPods?.invoke()?.firstOrNull { it.podId == podId }
+                    ?: return Triple(404, "Not Found", """{"error":"Pod $podId not found"}""")
+                Triple(200, "OK", podAdapter.toJson(pod))
+            }
+
+            method == "POST" && path == "/v1/pods/submit" -> {
+                val req = runCatching { podSubmitReqAdapter.fromJson(bodyText) }.getOrNull()
+                    ?: return Triple(400, "Bad Request", """{"error":"Invalid pod submit payload"}""")
+                val tokenToCheck = req.clusterToken.ifBlank { headerToken }
+                if (!tokenToCheck.equals(expectedToken, ignoreCase = true)) {
+                    return Triple(401, "Unauthorized", """{"error":"Cluster token mismatch"}""")
+                }
+                val submitHandler = onSubmitPod
+                    ?: return Triple(501, "Not Implemented", """{"error":"Pod submission not enabled on this node"}""")
+                val resp = submitHandler(req)
+                val status = if (resp.success) 200 to "OK" else 400 to "Bad Request"
+                Triple(status.first, status.second, podActionRespAdapter.toJson(resp))
+            }
+
+            (method == "POST" || method == "DELETE") && path.startsWith("/v1/pods/") && path.endsWith("/cancel") -> {
+                if (!isTokenAuthorized(headerToken, expectedToken)) {
+                    return Triple(401, "Unauthorized", """{"error":"Cluster token mismatch"}""")
+                }
+                val podId = path.removePrefix("/v1/pods/").removeSuffix("/cancel").trim('/')
+                val cancelHandler = onCancelPod
+                    ?: return Triple(501, "Not Implemented", """{"error":"Pod cancellation not enabled on this node"}""")
+                val resp = cancelHandler(podId)
+                val status = if (resp.success) 200 to "OK" else 404 to "Not Found"
+                Triple(status.first, status.second, podActionRespAdapter.toJson(resp))
             }
 
             method == "POST" && path == "/v1/pair" -> {
@@ -178,17 +310,28 @@ class NodeHttpServer(
                     )
                     Triple(403, "Forbidden", pairRespAdapter.toJson(resp))
                 } else {
-                    val effectivePeer = if (req.peerNode.hostIp == "127.0.0.1" && remoteIp.isNotEmpty()) {
+                    val effectivePeer = if (
+                        (req.peerNode.hostIp.isBlank() || req.peerNode.hostIp == "127.0.0.1" || req.peerNode.hostIp == "0.0.0.0") &&
+                        remoteIp.isNotEmpty()
+                    ) {
                         req.peerNode.copy(hostIp = remoteIp, isLocal = false)
                     } else {
                         req.peerNode.copy(isLocal = false)
                     }
                     onPeerPaired(effectivePeer, remoteIp)
+                    if (req.knownPeers.isNotEmpty()) {
+                        onGossipPeersReceived?.invoke(req.knownPeers)
+                    }
+                    val localTelemetry = getLocalTelemetry()
+                    val meshPeersForJoiner = getKnownPeers?.invoke().orEmpty().filterNot {
+                        it.nodeId == effectivePeer.nodeId || it.nodeId == localTelemetry.nodeId
+                    }
                     onServerLog("Paired peer ${effectivePeer.nodeName} (${effectivePeer.hostIp}:${effectivePeer.port})")
                     val resp = PairResponse(
                         accepted = true,
-                        message = "Unified with ${getLocalTelemetry().nodeName}",
-                        hostNode = getLocalTelemetry()
+                        message = "Unified with ${localTelemetry.nodeName}",
+                        hostNode = localTelemetry,
+                        meshPeers = meshPeersForJoiner
                     )
                     Triple(200, "OK", pairRespAdapter.toJson(resp))
                 }

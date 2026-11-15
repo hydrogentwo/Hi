@@ -25,7 +25,9 @@ import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.foundation.verticalScroll
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.rounded.AutoAwesome
+import androidx.compose.material.icons.rounded.Cancel
 import androidx.compose.material.icons.rounded.Code
+import androidx.compose.material.icons.rounded.DeleteSweep
 import androidx.compose.material.icons.rounded.Download
 import androidx.compose.material.icons.rounded.Functions
 import androidx.compose.material.icons.rounded.GridOn
@@ -54,6 +56,7 @@ import androidx.compose.material3.Surface
 import androidx.compose.material3.Tab
 import androidx.compose.material3.TabRow
 import androidx.compose.material3.Text
+import androidx.compose.material3.TextButton
 import androidx.compose.material3.minimumInteractiveComponentSize
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.getValue
@@ -88,6 +91,8 @@ fun WorkloadsScreen(
     uiState: ClusterUiState,
     onDeployPod: (WorkloadType, SchedulingPolicy, Int, String?) -> Unit,
     onInspectPod: (String?) -> Unit,
+    onCancelPod: (String) -> Unit = {},
+    onClearCompletedPods: () -> Unit = {},
     onRefreshAiCore: () -> Unit = {},
     onDownloadAiCore: () -> Unit = {},
     onWarmupAiCore: () -> Unit = {},
@@ -195,11 +200,36 @@ fun WorkloadsScreen(
         }
 
         item {
-            Text(
-                text = "POD WORKLOADS (${uiState.pods.size})",
-                style = MaterialTheme.typography.labelMedium,
-                color = MaterialTheme.colorScheme.onSurfaceVariant
-            )
+            val hasCompletedPods = uiState.pods.any {
+                it.phase == PodPhase.SUCCEEDED || it.phase == PodPhase.FAILED
+            }
+            Row(
+                modifier = Modifier.fillMaxWidth(),
+                horizontalArrangement = Arrangement.SpaceBetween,
+                verticalAlignment = Alignment.CenterVertically
+            ) {
+                Text(
+                    text = "POD WORKLOADS (${uiState.pods.size})",
+                    style = MaterialTheme.typography.labelMedium,
+                    color = MaterialTheme.colorScheme.onSurfaceVariant
+                )
+                if (hasCompletedPods) {
+                    TextButton(
+                        onClick = onClearCompletedPods,
+                        modifier = Modifier
+                            .minimumInteractiveComponentSize()
+                            .testTag("clear_completed_pods_btn")
+                    ) {
+                        Icon(
+                            imageVector = Icons.Rounded.DeleteSweep,
+                            contentDescription = null,
+                            modifier = Modifier.size(16.dp)
+                        )
+                        Spacer(Modifier.width(4.dp))
+                        Text("Clear History")
+                    }
+                }
+            }
         }
 
         if (uiState.pods.isEmpty()) {
@@ -239,7 +269,8 @@ fun WorkloadsScreen(
             items(uiState.pods, key = { it.podId }) { pod ->
                 PodExecutionCard(
                     pod = pod,
-                    onInspect = { onInspectPod(pod.podId) }
+                    onInspect = { onInspectPod(pod.podId) },
+                    onCancel = { onCancelPod(pod.podId) }
                 )
             }
         }
@@ -269,7 +300,10 @@ fun WorkloadsScreen(
             onDismissRequest = { onInspectPod(null) },
             containerColor = MaterialTheme.colorScheme.surface
         ) {
-            PodInspectorSheetContent(pod = inspectedPod)
+            PodInspectorSheetContent(
+                pod = inspectedPod,
+                onCancelPod = { onCancelPod(inspectedPod.podId) }
+            )
         }
     }
 }
@@ -324,7 +358,8 @@ private fun QuickDeployPresetChip(
 @Composable
 private fun PodExecutionCard(
     pod: ClusterPod,
-    onInspect: () -> Unit
+    onInspect: () -> Unit,
+    onCancel: () -> Unit = {}
 ) {
     val phaseColor = when (pod.phase) {
         PodPhase.PENDING -> AmberWarn
@@ -455,7 +490,27 @@ private fun PodExecutionCard(
                     style = MaterialTheme.typography.labelSmall,
                     color = MaterialTheme.colorScheme.onSurfaceVariant
                 )
-                Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+                Row(
+                    verticalAlignment = Alignment.CenterVertically,
+                    horizontalArrangement = Arrangement.spacedBy(8.dp)
+                ) {
+                    if (pod.phase == PodPhase.RUNNING || pod.phase == PodPhase.PENDING) {
+                        TextButton(
+                            onClick = onCancel,
+                            modifier = Modifier
+                                .minimumInteractiveComponentSize()
+                                .testTag("cancel_pod_btn_${pod.podId}")
+                        ) {
+                            Icon(
+                                imageVector = Icons.Rounded.Cancel,
+                                contentDescription = "Cancel pod",
+                                tint = RoseAlert,
+                                modifier = Modifier.size(16.dp)
+                            )
+                            Spacer(Modifier.width(4.dp))
+                            Text("Cancel", color = RoseAlert)
+                        }
+                    }
                     Text(
                         text = "Inspect YAML & Logs →",
                         style = MaterialTheme.typography.labelMedium,
@@ -651,7 +706,10 @@ private fun DeployPodSheetContent(
 }
 
 @Composable
-private fun PodInspectorSheetContent(pod: ClusterPod) {
+private fun PodInspectorSheetContent(
+    pod: ClusterPod,
+    onCancelPod: () -> Unit = {}
+) {
     var tabIndex by remember { mutableIntStateOf(0) }
 
     Column(
@@ -661,10 +719,30 @@ private fun PodInspectorSheetContent(pod: ClusterPod) {
             .padding(bottom = 28.dp),
         verticalArrangement = Arrangement.spacedBy(12.dp)
     ) {
-        Text(
-            text = pod.name,
-            style = MaterialTheme.typography.headlineSmall.copy(fontFamily = JetBrainsMonoFontFamily)
-        )
+        Row(
+            modifier = Modifier.fillMaxWidth(),
+            horizontalArrangement = Arrangement.SpaceBetween,
+            verticalAlignment = Alignment.CenterVertically
+        ) {
+            Text(
+                text = pod.name,
+                style = MaterialTheme.typography.headlineSmall.copy(fontFamily = JetBrainsMonoFontFamily),
+                modifier = Modifier.weight(1f),
+                maxLines = 1,
+                overflow = TextOverflow.Ellipsis
+            )
+            if (pod.phase == PodPhase.RUNNING || pod.phase == PodPhase.PENDING) {
+                OutlinedButton(
+                    onClick = onCancelPod,
+                    modifier = Modifier
+                        .height(40.dp)
+                        .testTag("sheet_cancel_pod_btn"),
+                    border = BorderStroke(1.dp, RoseAlert.copy(alpha = 0.6f))
+                ) {
+                    Text("Cancel Pod", color = RoseAlert)
+                }
+            }
+        }
         Text(
             text = pod.aggregatedResult,
             style = MaterialTheme.typography.labelMedium,
@@ -744,6 +822,7 @@ private fun AiCoreClusterCard(
 
     val statusColor = when (localAi.status) {
         AiCoreStatus.AVAILABLE -> EmeraldReady
+        AiCoreStatus.CLOUD_READY -> ElectricCyan
         AiCoreStatus.DOWNLOADABLE, AiCoreStatus.DOWNLOADING -> ElectricCyan
         AiCoreStatus.UNAVAILABLE -> AmberWarn
         AiCoreStatus.UNKNOWN -> MaterialTheme.colorScheme.onSurfaceVariant

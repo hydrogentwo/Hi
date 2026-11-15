@@ -74,6 +74,7 @@ data class NodeMetricSample(
 enum class AiCoreStatus(val label: String) {
     UNKNOWN("Checking"),
     AVAILABLE("Nano Ready"),
+    CLOUD_READY("Cloud Gemini"),
     DOWNLOADABLE("Downloadable"),
     DOWNLOADING("Downloading"),
     UNAVAILABLE("Unavailable");
@@ -178,6 +179,7 @@ enum class TaskQueueItemStatus(val label: String) {
     FAILED("Failed")
 }
 
+@JsonClass(generateAdapter = true)
 data class QueuedChunkState(
     val podId: String,
     val podName: String,
@@ -197,6 +199,7 @@ data class QueuedChunkState(
     val errorMessage: String? = null
 )
 
+@JsonClass(generateAdapter = true)
 data class PodShard(
     val shardId: String,
     val nodeId: String,
@@ -217,6 +220,7 @@ data class PodShard(
     val chunksCompleted: Int = 1
 )
 
+@JsonClass(generateAdapter = true)
 data class ClusterPod(
     val podId: String,
     val name: String,
@@ -244,14 +248,46 @@ data class ClusterPod(
 @JsonClass(generateAdapter = true)
 data class PairRequest(
     val clusterToken: String,
-    val peerNode: NodeTelemetry
+    val peerNode: NodeTelemetry,
+    val knownPeers: List<NodeTelemetry> = emptyList()
 )
 
 @JsonClass(generateAdapter = true)
 data class PairResponse(
     val accepted: Boolean,
     val message: String,
-    val hostNode: NodeTelemetry
+    val hostNode: NodeTelemetry,
+    val meshPeers: List<NodeTelemetry> = emptyList()
+)
+
+@JsonClass(generateAdapter = true)
+data class ClusterSnapshotResponse(
+    val generatedAtMs: Long = System.currentTimeMillis(),
+    val localNode: NodeTelemetry,
+    val peers: List<NodeTelemetry> = emptyList(),
+    val unreachablePeerIds: List<String> = emptyList(),
+    val totalCpuCores: Int,
+    val totalRamMb: Long,
+    val availRamMb: Long,
+    val activePodsCount: Int,
+    val pods: List<ClusterPod> = emptyList(),
+    val recentLogs: List<String> = emptyList()
+)
+
+@JsonClass(generateAdapter = true)
+data class PodSubmitRequest(
+    val clusterToken: String,
+    val workloadId: String,
+    val schedulingPolicy: String = SchedulingPolicy.PROPORTIONAL_SPLIT.name,
+    val scaleMultiplier: Int = 1,
+    val customPodName: String? = null
+)
+
+@JsonClass(generateAdapter = true)
+data class PodActionResponse(
+    val success: Boolean,
+    val message: String,
+    val pod: ClusterPod? = null
 )
 
 @JsonClass(generateAdapter = true)
