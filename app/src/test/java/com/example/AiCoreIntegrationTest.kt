@@ -77,7 +77,7 @@ class AiCoreIntegrationTest {
 
     @Test
     fun `AiCoreEngine reports UNAVAILABLE gracefully when AICore binder is absent`() = runBlocking {
-        val engine = AiCoreEngine(modelFactory = { null })
+        val engine = AiCoreEngine(modelFactory = { null }, cloudFallback = null)
         val status = engine.refreshStatus()
         assertEquals(AiCoreStatus.UNAVAILABLE, status)
 

@@ -244,6 +244,8 @@ fun KubeMeshApp(
                                 uiState = uiState,
                                 onDeployPod = viewModel::deployPod,
                                 onInspectPod = viewModel::selectPodForLogs,
+                                onCancelPod = viewModel::cancelPod,
+                                onClearCompletedPods = viewModel::clearCompletedPods,
                                 onRefreshAiCore = viewModel::refreshAiCoreStatus,
                                 onDownloadAiCore = viewModel::downloadAiCoreModel,
                                 onWarmupAiCore = viewModel::warmupAiCore,

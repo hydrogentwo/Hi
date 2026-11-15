@@ -639,7 +639,9 @@ fun NodeTelemetryCard(
                         text = "AICore: ${aiStatus.label}",
                         tint = when (aiStatus) {
                             AiCoreStatus.AVAILABLE -> EmeraldReady
-                            AiCoreStatus.DOWNLOADABLE, AiCoreStatus.DOWNLOADING -> ElectricCyan
+                            AiCoreStatus.CLOUD_READY,
+                            AiCoreStatus.DOWNLOADABLE,
+                            AiCoreStatus.DOWNLOADING -> ElectricCyan
                             else -> MaterialTheme.colorScheme.onSurfaceVariant
                         }
                     )

@@ -2,12 +2,17 @@ package com.example.cluster.network
 
 import com.example.cluster.model.AiCorePromptRequest
 import com.example.cluster.model.AiCorePromptResponse
+import com.example.cluster.model.ClusterPod
+import com.example.cluster.model.ClusterSnapshotResponse
 import com.example.cluster.model.NodeTelemetry
 import com.example.cluster.model.PairRequest
 import com.example.cluster.model.PairResponse
+import com.example.cluster.model.PodActionResponse
+import com.example.cluster.model.PodSubmitRequest
 import com.example.cluster.model.ShardExecuteRequest
 import com.example.cluster.model.ShardExecuteResponse
 import com.squareup.moshi.Moshi
+import com.squareup.moshi.Types
 import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.suspendCancellableCoroutine
@@ -41,6 +46,15 @@ class ClusterClient(private val moshi: Moshi) {
         .build()
 
     private val telemetryAdapter = moshi.adapter(NodeTelemetry::class.java)
+    private val nodeListAdapter = moshi.adapter<List<NodeTelemetry>>(
+        Types.newParameterizedType(List::class.java, NodeTelemetry::class.java)
+    )
+    private val snapshotAdapter = moshi.adapter(ClusterSnapshotResponse::class.java)
+    private val podListAdapter = moshi.adapter<List<ClusterPod>>(
+        Types.newParameterizedType(List::class.java, ClusterPod::class.java)
+    )
+    private val podSubmitReqAdapter = moshi.adapter(PodSubmitRequest::class.java)
+    private val podActionRespAdapter = moshi.adapter(PodActionResponse::class.java)
     private val pairReqAdapter = moshi.adapter(PairRequest::class.java)
     private val pairRespAdapter = moshi.adapter(PairResponse::class.java)
     private val shardReqAdapter = moshi.adapter(ShardExecuteRequest::class.java)
@@ -52,17 +66,18 @@ class ClusterClient(private val moshi: Moshi) {
         host: String,
         port: Int,
         clusterToken: String,
-        localNode: NodeTelemetry
+        localNode: NodeTelemetry,
+        knownPeers: List<NodeTelemetry> = emptyList()
     ): Result<PairResponse> = withContext(Dispatchers.IO) {
         runCatching {
-            val payload = pairReqAdapter.toJson(PairRequest(clusterToken, localNode))
+            val payload = pairReqAdapter.toJson(PairRequest(clusterToken, localNode, knownPeers))
             val req = Request.Builder()
                 .url("http://$host:$port/v1/pair")
                 .addHeader("X-Cluster-Token", clusterToken)
                 .post(payload.toRequestBody(jsonMedia))
                 .build()
             val startNs = System.nanoTime()
-            fastClient.newCall(req).execute().use { resp ->
+            fastClient.newCall(req).awaitResponse().use { resp ->
                 val rttMs = ((System.nanoTime() - startNs) / 1_000_000L).coerceAtLeast(1L)
                 val body = resp.body?.string().orEmpty()
                 val parsed = runCatching { pairRespAdapter.fromJson(body) }.getOrNull()
@@ -77,9 +92,12 @@ class ClusterClient(private val moshi: Moshi) {
                         rttMs = rttMs,
                         lastHeartbeatMs = System.currentTimeMillis(),
                         isLocal = false
-                    )
+                    ),
+                    meshPeers = parsed.meshPeers.map { it.copy(isLocal = false) }
                 )
             }
+        }.onFailure { err ->
+            if (err is CancellationException) throw err
         }
     }
 
@@ -95,7 +113,7 @@ class ClusterClient(private val moshi: Moshi) {
                 .get()
                 .build()
             val startNs = System.nanoTime()
-            fastClient.newCall(req).execute().use { resp ->
+            fastClient.newCall(req).awaitResponse().use { resp ->
                 val rttMs = ((System.nanoTime() - startNs) / 1_000_000L).coerceAtLeast(1L)
                 val body = resp.body?.string().orEmpty()
                 if (!resp.isSuccessful) {
@@ -111,6 +129,130 @@ class ClusterClient(private val moshi: Moshi) {
                     isLocal = false
                 )
             }
+        }.onFailure { err ->
+            if (err is CancellationException) throw err
+        }
+    }
+
+    suspend fun fetchClusterState(
+        host: String,
+        port: Int,
+        clusterToken: String
+    ): Result<ClusterSnapshotResponse> = withContext(Dispatchers.IO) {
+        runCatching {
+            val req = Request.Builder()
+                .url("http://$host:$port/v1/cluster/state")
+                .addHeader("X-Cluster-Token", clusterToken)
+                .get()
+                .build()
+            fastClient.newCall(req).awaitResponse().use { resp ->
+                val body = resp.body?.string().orEmpty()
+                if (!resp.isSuccessful) {
+                    throw IllegalStateException("Cluster state HTTP ${resp.code}: $body")
+                }
+                snapshotAdapter.fromJson(body)
+                    ?: throw IllegalStateException("Malformed cluster snapshot JSON")
+            }
+        }.onFailure { err ->
+            if (err is CancellationException) throw err
+        }
+    }
+
+    suspend fun fetchMeshNodes(
+        host: String,
+        port: Int,
+        clusterToken: String
+    ): Result<List<NodeTelemetry>> = withContext(Dispatchers.IO) {
+        runCatching {
+            val req = Request.Builder()
+                .url("http://$host:$port/v1/nodes")
+                .addHeader("X-Cluster-Token", clusterToken)
+                .get()
+                .build()
+            fastClient.newCall(req).awaitResponse().use { resp ->
+                val body = resp.body?.string().orEmpty()
+                if (!resp.isSuccessful) {
+                    throw IllegalStateException("Mesh nodes HTTP ${resp.code}")
+                }
+                nodeListAdapter.fromJson(body)?.map { it.copy(isLocal = false) }
+                    ?: throw IllegalStateException("Malformed nodes JSON")
+            }
+        }.onFailure { err ->
+            if (err is CancellationException) throw err
+        }
+    }
+
+    suspend fun fetchRemotePods(
+        host: String,
+        port: Int,
+        clusterToken: String
+    ): Result<List<ClusterPod>> = withContext(Dispatchers.IO) {
+        runCatching {
+            val req = Request.Builder()
+                .url("http://$host:$port/v1/pods")
+                .addHeader("X-Cluster-Token", clusterToken)
+                .get()
+                .build()
+            fastClient.newCall(req).awaitResponse().use { resp ->
+                val body = resp.body?.string().orEmpty()
+                if (!resp.isSuccessful) {
+                    throw IllegalStateException("Pods HTTP ${resp.code}")
+                }
+                podListAdapter.fromJson(body)
+                    ?: throw IllegalStateException("Malformed pods JSON")
+            }
+        }.onFailure { err ->
+            if (err is CancellationException) throw err
+        }
+    }
+
+    suspend fun submitRemotePod(
+        host: String,
+        port: Int,
+        request: PodSubmitRequest
+    ): Result<PodActionResponse> = withContext(Dispatchers.IO) {
+        runCatching {
+            val payload = podSubmitReqAdapter.toJson(request)
+            val req = Request.Builder()
+                .url("http://$host:$port/v1/pods/submit")
+                .addHeader("X-Cluster-Token", request.clusterToken)
+                .post(payload.toRequestBody(jsonMedia))
+                .build()
+            fastClient.newCall(req).awaitResponse().use { resp ->
+                val body = resp.body?.string().orEmpty()
+                val parsed = runCatching { podActionRespAdapter.fromJson(body) }.getOrNull()
+                if (!resp.isSuccessful || parsed == null || !parsed.success) {
+                    throw IllegalStateException(parsed?.message ?: "Remote pod submit HTTP ${resp.code}")
+                }
+                parsed
+            }
+        }.onFailure { err ->
+            if (err is CancellationException) throw err
+        }
+    }
+
+    suspend fun cancelRemotePod(
+        host: String,
+        port: Int,
+        clusterToken: String,
+        podId: String
+    ): Result<PodActionResponse> = withContext(Dispatchers.IO) {
+        runCatching {
+            val req = Request.Builder()
+                .url("http://$host:$port/v1/pods/$podId/cancel")
+                .addHeader("X-Cluster-Token", clusterToken)
+                .post("{}".toRequestBody(jsonMedia))
+                .build()
+            fastClient.newCall(req).awaitResponse().use { resp ->
+                val body = resp.body?.string().orEmpty()
+                val parsed = runCatching { podActionRespAdapter.fromJson(body) }.getOrNull()
+                if (!resp.isSuccessful || parsed == null || !parsed.success) {
+                    throw IllegalStateException(parsed?.message ?: "Remote pod cancel HTTP ${resp.code}")
+                }
+                parsed
+            }
+        }.onFailure { err ->
+            if (err is CancellationException) throw err
         }
     }
 
@@ -171,7 +313,7 @@ class ClusterClient(private val moshi: Moshi) {
                 .addHeader("X-Cluster-Token", request.clusterToken)
                 .post(payload.toRequestBody(jsonMedia))
                 .build()
-            computeClient.newCall(req).execute().use { resp ->
+            computeClient.newCall(req).awaitResponse().use { resp ->
                 val body = resp.body?.string().orEmpty()
                 if (!resp.isSuccessful) {
                     throw IllegalStateException("Remote AICore HTTP ${resp.code}: $body")
@@ -179,6 +321,8 @@ class ClusterClient(private val moshi: Moshi) {
                 aiRespAdapter.fromJson(body)
                     ?: throw IllegalStateException("Malformed remote AICore response")
             }
+        }.onFailure { err ->
+            if (err is CancellationException) throw err
         }
     }
 
@@ -194,7 +338,9 @@ class ClusterClient(private val moshi: Moshi) {
                 .addHeader("X-Cluster-Token", clusterToken)
                 .post(localNodeId.toRequestBody(jsonMedia))
                 .build()
-            fastClient.newCall(req).execute().close()
+            fastClient.newCall(req).awaitResponse().close()
+        }.onFailure { err ->
+            if (err is CancellationException) throw err
         }
     }
 }
